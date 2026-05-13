@@ -34,7 +34,19 @@ export type Trade = {
   notes?: string;
 };
 
-export type DrawingTool = "cursor" | "trend" | "horizontal" | "fib" | "brush" | "text" | "measure";
+export type DrawingTool =
+  | "cursor"
+  | "trend"
+  | "horizontal"
+  | "vertical"
+  | "cross"
+  | "rectangle"
+  | "fib"
+  | "brush"
+  | "text"
+  | "measure"
+  | "long-position"
+  | "short-position";
 
 export type DrawingAnchor = {
   time: number;

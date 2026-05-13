@@ -38,6 +38,15 @@ import {
 import { generateDemoCandles } from "@/lib/backtest/demo-data";
 import { ema, rsi, vwap } from "@/lib/backtest/indicators";
 import {
+  ACTIVE_SNAPSHOT_ID,
+  clearBacktesterStorage,
+  createBacktesterDatasetId,
+  loadBacktesterSession,
+  saveBacktesterDataset,
+  saveBacktesterSnapshot,
+  type BacktesterSourceType,
+} from "@/lib/backtest/local-db";
+import {
   estimateBaseTimeframeMinutes,
   parseCsvCandles,
   resampleCandles,
@@ -53,12 +62,22 @@ import { RsiPanel } from "./rsi-panel";
 const timeframes: Timeframe[] = ["1m", "5m", "15m", "1h", "1d"];
 const speedOptions = [1, 2, 5, 10, 25];
 
+type LoadCandlesOptions = {
+  datasetId?: string;
+  persistDataset?: boolean;
+  replayTime?: number | null;
+  trades?: Trade[];
+  drawings?: ChartDrawing[];
+  pendingNote?: string;
+};
+
 export function NqBacktester() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const timeframeRef = useRef<Timeframe>("1m");
+  const hasHydratedRef = useRef(false);
   const [baseCandles, setBaseCandles] = useState<Candle[]>([]);
   const [sourceLabel, setSourceLabel] = useState("Loading NQ preview");
-  const [sourceType, setSourceType] = useState<"real" | "demo" | "empty">("empty");
+  const [sourceType, setSourceType] = useState<BacktesterSourceType>("empty");
   const [timeframe, setTimeframe] = useState<Timeframe>("1m");
   const [replayTime, setReplayTime] = useState<number | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -76,9 +95,14 @@ export function NqBacktester() {
   const [showVwap, setShowVwap] = useState(true);
   const [showRsi, setShowRsi] = useState(false);
   const [showVolume, setShowVolume] = useState(true);
+  const [magnetEnabled, setMagnetEnabled] = useState(false);
+  const [showSessionBands, setShowSessionBands] = useState(true);
   const [activeDrawingTool, setActiveDrawingTool] = useState<DrawingTool>("cursor");
   const [drawings, setDrawings] = useState<ChartDrawing[]>([]);
   const [pendingDrawing, setPendingDrawing] = useState<ChartDrawing | null>(null);
+  const [activeDatasetId, setActiveDatasetId] = useState<string | null>(null);
+  const [dbStatus, setDbStatus] = useState("Local DB starting");
+  const [savedAt, setSavedAt] = useState<number | null>(null);
 
   const baseMinutes = useMemo(() => estimateBaseTimeframeMinutes(baseCandles), [baseCandles]);
   const availableTimeframes = useMemo(
@@ -122,8 +146,7 @@ export function NqBacktester() {
     [currentTime, trades],
   );
   const openTrade = visibleTrades.find((trade) => !trade.exitTime);
-  const closedVisibleTrades = visibleTrades.filter((trade) => trade.exitTime);
-  const stats = useMemo(() => getTradeStats(visibleTrades), [visibleTrades]);
+  const stats = useMemo(() => getTradeStats(trades), [trades]);
   const session = currentTime ? sessionForTimestamp(currentTime) : null;
   const sessionMarkers = useMemo(() => getSessionStartMarkers(visibleCandles), [visibleCandles]);
   const progress = candles.length > 1 && activeIndex >= 0 ? activeIndex / (candles.length - 1) : 0;
@@ -141,10 +164,17 @@ export function NqBacktester() {
     timeframeRef.current = timeframe;
   }, [timeframe]);
 
-  const loadCandles = useCallback((nextCandles: Candle[], label: string, nextSourceType: "real" | "demo", nextStatus: string) => {
+  const loadCandles = useCallback((
+    nextCandles: Candle[],
+    label: string,
+    nextSourceType: Exclude<BacktesterSourceType, "empty">,
+    nextStatus: string,
+    options: LoadCandlesOptions = {},
+  ) => {
     const sorted = nextCandles
       .filter((candle) => [candle.open, candle.high, candle.low, candle.close, candle.time].every(Number.isFinite))
       .sort((a, b) => a.time - b.time);
+    const datasetId = options.datasetId ?? createBacktesterDatasetId(label, nextSourceType, sorted);
     const estimatedBaseMinutes = estimateBaseTimeframeMinutes(sorted);
     const selectedMinutes = timeframeToMinutes(timeframeRef.current);
     const estimatedBars = Math.max(1, Math.floor((sorted.length * estimatedBaseMinutes) / selectedMinutes));
@@ -154,14 +184,34 @@ export function NqBacktester() {
       sorted.length - 1,
       Math.max(0, Math.round((warmupIndex * selectedMinutes) / Math.max(estimatedBaseMinutes, 1))),
     );
+    const nextReplayTime = options.replayTime ?? sorted[warmupBaseIndex]?.time ?? null;
 
     setBaseCandles(sorted);
+    setActiveDatasetId(datasetId);
     setSourceLabel(label);
     setSourceType(nextSourceType);
     setStatus(nextStatus);
-    setTrades([]);
-    setReplayTime(sorted[warmupBaseIndex]?.time ?? null);
+    setTrades(options.trades ?? []);
+    setDrawings(options.drawings ?? []);
+    setPendingNote(options.pendingNote ?? "");
+    setReplayTime(nextReplayTime);
     setIsPlaying(false);
+
+    if (options.persistDataset !== false && sorted.length) {
+      void saveBacktesterDataset({
+        id: datasetId,
+        label,
+        sourceType: nextSourceType,
+        candles: sorted,
+        barCount: sorted.length,
+        rangeStart: sorted[0]?.time ?? null,
+        rangeEnd: sorted.at(-1)?.time ?? null,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      })
+        .then(() => setDbStatus("Dataset cached"))
+        .catch((error) => setDbStatus(error instanceof Error ? error.message : "Local DB cache failed"));
+    }
   }, []);
 
   const loadPreview = useCallback(async () => {
@@ -181,7 +231,9 @@ export function NqBacktester() {
       loadCandles(payload.candles, `Yahoo NQ=F ${payload.interval} ${payload.range}`, "real", "Yahoo preview loaded");
     } catch (error) {
       setBaseCandles([]);
+      setActiveDatasetId(null);
       setTrades([]);
+      setDrawings([]);
       setReplayTime(null);
       setStatus(error instanceof Error ? error.message : "Yahoo preview unavailable");
       setSourceLabel("CSV required for full history");
@@ -222,7 +274,9 @@ export function NqBacktester() {
       );
     } catch (error) {
       setBaseCandles([]);
+      setActiveDatasetId(null);
       setTrades([]);
+      setDrawings([]);
       setReplayTime(null);
       setStatus(error instanceof Error ? error.message : "Local dataset unavailable");
       setSourceLabel("Local CSV failed");
@@ -233,7 +287,65 @@ export function NqBacktester() {
   }, [loadCandles]);
 
   useEffect(() => {
-    void loadPreview();
+    let isCancelled = false;
+
+    async function hydrateFromLocalDb() {
+      setDbStatus("Opening local DB");
+
+      try {
+        const { snapshot, dataset } = await loadBacktesterSession();
+
+        if (isCancelled) {
+          return;
+        }
+
+        if (snapshot && dataset?.candles.length) {
+          timeframeRef.current = snapshot.timeframe;
+          setBaseCandles(dataset.candles);
+          setActiveDatasetId(dataset.id);
+          setSourceLabel(snapshot.sourceLabel || dataset.label);
+          setSourceType(snapshot.sourceType);
+          setStatus(snapshot.status || "Restored local session");
+          setTimeframe(snapshot.timeframe);
+          setReplayTime(snapshot.replayTime);
+          setSpeed(snapshot.speed);
+          setContracts(snapshot.contracts);
+          setStopPoints(snapshot.stopPoints);
+          setTargetPoints(snapshot.targetPoints);
+          setPendingNote(snapshot.pendingNote);
+          setTrades(snapshot.trades);
+          setDrawings(snapshot.drawings);
+          setShowEma9(snapshot.showEma9);
+          setShowEma20(snapshot.showEma20);
+          setShowEma50(snapshot.showEma50);
+          setShowVwap(snapshot.showVwap);
+          setShowRsi(snapshot.showRsi);
+          setShowVolume(snapshot.showVolume);
+          setMagnetEnabled(Boolean(snapshot.magnetEnabled));
+          setIsPlaying(false);
+          setIsLoading(false);
+          setDbStatus("Restored local DB");
+          setSavedAt(snapshot.updatedAt);
+          hasHydratedRef.current = true;
+          return;
+        }
+      } catch (error) {
+        if (!isCancelled) {
+          setDbStatus(error instanceof Error ? error.message : "Local DB unavailable");
+        }
+      }
+
+      if (!isCancelled) {
+        await loadPreview();
+        hasHydratedRef.current = true;
+      }
+    }
+
+    void hydrateFromLocalDb();
+
+    return () => {
+      isCancelled = true;
+    };
   }, [loadPreview]);
 
   useEffect(() => {
@@ -264,6 +376,122 @@ export function NqBacktester() {
       return time;
     });
   }, [candles]);
+
+  useEffect(() => {
+    if (!hasHydratedRef.current) {
+      return;
+    }
+
+    const timeout = window.setTimeout(() => {
+      const updatedAt = Date.now();
+
+      void saveBacktesterSnapshot({
+        id: ACTIVE_SNAPSHOT_ID,
+        schemaVersion: 1,
+        datasetId: activeDatasetId,
+        updatedAt,
+        sourceLabel,
+        sourceType,
+        status,
+        timeframe,
+        replayTime,
+        speed,
+        contracts,
+        stopPoints,
+        targetPoints,
+        pendingNote,
+        trades,
+        drawings,
+        showEma9,
+        showEma20,
+        showEma50,
+        showVwap,
+        showRsi,
+        showVolume,
+        magnetEnabled,
+      })
+        .then(() => {
+          setSavedAt(updatedAt);
+          setDbStatus("Saved locally");
+        })
+        .catch((error) => setDbStatus(error instanceof Error ? error.message : "Local DB save failed"));
+    }, 350);
+
+    return () => window.clearTimeout(timeout);
+  }, [
+    activeDatasetId,
+    contracts,
+    drawings,
+    magnetEnabled,
+    pendingNote,
+    replayTime,
+    showEma9,
+    showEma20,
+    showEma50,
+    showRsi,
+    showVolume,
+    showVwap,
+    sourceLabel,
+    sourceType,
+    speed,
+    status,
+    stopPoints,
+    targetPoints,
+    timeframe,
+    trades,
+  ]);
+
+  useEffect(() => {
+    function handleUndoDrawing(event: KeyboardEvent) {
+      if (!event.ctrlKey || event.shiftKey || event.altKey || event.key.toLowerCase() !== "z") {
+        return;
+      }
+
+      if (isEditableTarget(event.target)) {
+        return;
+      }
+
+      if (!pendingDrawing && drawings.length === 0) {
+        return;
+      }
+
+      event.preventDefault();
+
+      if (pendingDrawing) {
+        setPendingDrawing(null);
+        return;
+      }
+
+      setDrawings((currentDrawings) => currentDrawings.slice(0, -1));
+    }
+
+    window.addEventListener("keydown", handleUndoDrawing);
+
+    return () => window.removeEventListener("keydown", handleUndoDrawing);
+  }, [drawings.length, pendingDrawing]);
+
+  useEffect(() => {
+    function handleDrawingShortcuts(event: KeyboardEvent) {
+      if (isEditableTarget(event.target)) {
+        return;
+      }
+
+      const key = event.key.toLowerCase();
+      const tool = drawingToolForShortcut(key, event.altKey, event.shiftKey, event.ctrlKey, event.metaKey);
+
+      if (!tool) {
+        return;
+      }
+
+      event.preventDefault();
+      setActiveDrawingTool(tool);
+      setPendingDrawing(null);
+    }
+
+    window.addEventListener("keydown", handleDrawingShortcuts);
+
+    return () => window.removeEventListener("keydown", handleDrawingShortcuts);
+  }, []);
 
   const moveToIndex = useCallback(
     (targetIndex: number) => {
@@ -349,6 +577,40 @@ export function NqBacktester() {
     setPendingNote("");
   }
 
+  function handleActivatePosition(drawing: ChartDrawing) {
+    if ((drawing.type !== "long-position" && drawing.type !== "short-position") || !currentCandle || openTrade) {
+      return;
+    }
+
+    const [entryAnchor, stopAnchor, targetAnchor] = drawing.points;
+
+    if (!stopAnchor || !targetAnchor) {
+      return;
+    }
+
+    const side: TradeSide = drawing.type === "long-position" ? "long" : "short";
+    const plannedStop = Math.abs(entryAnchor.price - stopAnchor.price);
+    const plannedTarget = Math.abs(targetAnchor.price - entryAnchor.price);
+    const roundedStop = Math.max(NQ_TICK_SIZE, Math.round(plannedStop / NQ_TICK_SIZE) * NQ_TICK_SIZE);
+    const roundedTarget = Math.max(NQ_TICK_SIZE, Math.round(plannedTarget / NQ_TICK_SIZE) * NQ_TICK_SIZE);
+
+    const trade = createTrade({
+      side,
+      candle: currentCandle,
+      index: activeIndex,
+      contracts,
+      stopPoints: roundedStop,
+      targetPoints: roundedTarget,
+      notes: pendingNote.trim() || undefined,
+    });
+
+    setDrawings((prev) => prev.filter((d) => d.id !== drawing.id));
+    setTrades((prev) => [...prev, trade]);
+    setPendingNote("");
+    setActiveDrawingTool("cursor");
+    setPendingDrawing(null);
+  }
+
   function exitOpenTrade() {
     if (!currentCandle || !openTrade) {
       return;
@@ -375,6 +637,32 @@ export function NqBacktester() {
     anchor.download = `nq-backtest-${new Date().toISOString().slice(0, 10)}.json`;
     anchor.click();
     URL.revokeObjectURL(url);
+  }
+
+  async function clearLocalSave() {
+    try {
+      hasHydratedRef.current = false;
+      await clearBacktesterStorage();
+      setBaseCandles([]);
+      setActiveDatasetId(null);
+      setSourceLabel("CSV required for full history");
+      setSourceType("empty");
+      setStatus("Local save cleared");
+      setTrades([]);
+      setDrawings([]);
+      setPendingDrawing(null);
+      setPendingNote("");
+      setReplayTime(null);
+      setIsPlaying(false);
+      setSavedAt(null);
+      setDbStatus("Local DB cleared");
+    } catch (error) {
+      setDbStatus(error instanceof Error ? error.message : "Local DB clear failed");
+    } finally {
+      window.setTimeout(() => {
+        hasHydratedRef.current = true;
+      }, 500);
+    }
   }
 
   function selectDrawingTool(tool: DrawingTool) {
@@ -512,6 +800,15 @@ export function NqBacktester() {
             <RailButton title="Horizontal line" active={activeDrawingTool === "horizontal"} onClick={() => selectDrawingTool("horizontal")}>
               <MinusIcon />
             </RailButton>
+            <RailButton title="Vertical line" active={activeDrawingTool === "vertical"} onClick={() => selectDrawingTool("vertical")}>
+              <VerticalIcon />
+            </RailButton>
+            <RailButton title="Cross line" active={activeDrawingTool === "cross"} onClick={() => selectDrawingTool("cross")}>
+              <CrossLineIcon />
+            </RailButton>
+            <RailButton title="Rectangle" active={activeDrawingTool === "rectangle"} onClick={() => selectDrawingTool("rectangle")}>
+              <RectangleIcon />
+            </RailButton>
             <RailButton title="Fib retracement" active={activeDrawingTool === "fib"} onClick={() => selectDrawingTool("fib")}>
               <FibIcon />
             </RailButton>
@@ -524,8 +821,14 @@ export function NqBacktester() {
             <RailButton title="Measure" active={activeDrawingTool === "measure"} onClick={() => selectDrawingTool("measure")}>
               <Ruler className="size-5" />
             </RailButton>
+            <RailButton title="Long Position (Alt+L)" active={activeDrawingTool === "long-position"} onClick={() => selectDrawingTool("long-position")}>
+              <LongPositionIcon />
+            </RailButton>
+            <RailButton title="Short Position (Alt+Shift+L)" active={activeDrawingTool === "short-position"} onClick={() => selectDrawingTool("short-position")}>
+              <ShortPositionIcon />
+            </RailButton>
             <RailDivider />
-            <RailButton title="Magnet">
+            <RailButton title="Magnet" active={magnetEnabled} onClick={() => setMagnetEnabled((value) => !value)}>
               <Magnet className="size-5" />
             </RailButton>
             <RailButton title="Lock">
@@ -579,10 +882,15 @@ export function NqBacktester() {
                   showVolume={showVolume}
                   openTrade={openTrade}
                   activeDrawingTool={activeDrawingTool}
+                  magnetEnabled={magnetEnabled}
                   drawings={drawings}
                   pendingDrawing={pendingDrawing}
+                  stopPoints={stopPoints}
+                  targetPoints={targetPoints}
+                  showSessionBands={showSessionBands}
                   onDrawingsChange={setDrawings}
                   onPendingDrawingChange={setPendingDrawing}
+                  onActivatePosition={handleActivatePosition}
                 />
               </div>
             ) : (
@@ -661,13 +969,17 @@ export function NqBacktester() {
                 <TerminalToggle label="VWAP" checked={showVwap} onChange={setShowVwap} />
                 <TerminalToggle label="RSI" checked={showRsi} onChange={setShowRsi} />
                 <TerminalToggle label="Volume" checked={showVolume} onChange={setShowVolume} />
+                <div className="mt-1 border-t border-[#202124] pt-3">
+                  <p className="mb-2 text-[11px] font-bold uppercase text-[#7b8088]">Sessions</p>
+                  <TerminalToggle label="Asia / London / US bands" checked={showSessionBands} onChange={setShowSessionBands} />
+                </div>
               </div>
             </SideSection>
 
             <SideSection title="Journal">
               <div className="space-y-4">
-                {closedVisibleTrades.length ? (
-                  closedVisibleTrades
+                {stats.closedTrades.length ? (
+                  stats.closedTrades
                     .slice()
                     .reverse()
                     .slice(0, 6)
@@ -689,11 +1001,33 @@ export function NqBacktester() {
               </div>
             </SideSection>
 
+            <SideSection title="Analysis">
+              <div className="grid grid-cols-2 gap-x-5 gap-y-3 text-sm">
+                <PlainStat label="Win Rate" value={formatPercent(stats.winRate)} />
+                <PlainStat label="Profit Factor" value={formatRatio(stats.profitFactor)} />
+                <PlainStat label="Expectancy" value={formatMoney(stats.expectancy)} />
+                <PlainStat label="Avg Trade" value={formatMoney(stats.averageTrade)} />
+                <PlainStat label="Avg Win" value={formatMoney(stats.averageWin)} />
+                <PlainStat label="Avg Loss" value={formatMoney(-stats.averageLoss)} />
+              </div>
+            </SideSection>
+
             <SideSection title="Data">
               <div className="grid gap-3 text-sm">
                 <PlainStat label="Bars" value={candles.length ? candles.length.toLocaleString() : "--"} />
                 <PlainStat label="Range" value={formatRange(candles)} />
                 <PlainStat label="Mode" value={sourceType} />
+                <PlainStat label="Local DB" value={dbStatus} />
+                <PlainStat label="Saved" value={savedAt ? formatSavedTime(savedAt) : "--"} />
+                <PlainStat label="Dataset" value={activeDatasetId ? "cached" : "--"} />
+                <button
+                  type="button"
+                  onClick={() => void clearLocalSave()}
+                  className="inline-flex h-9 items-center gap-2 text-sm font-semibold text-[#c8c8c8] transition hover:text-white"
+                >
+                  <Trash2 className="size-4" />
+                  Clear save
+                </button>
                 <a className="font-semibold text-[#8ab4f8] hover:text-white" href="https://www.kaggle.com/datasets/tgtanalytics/nq-futures-1min-bar-2022-2025" target="_blank" rel="noreferrer">
                   NQ Futures - 1min Bar 2022 2025
                 </a>
@@ -797,7 +1131,7 @@ export function NqBacktester() {
           <div className="hidden items-center gap-8 text-sm lg:flex">
             <BottomMetric label="Progress" value={`${Math.round(progress * 100)}%`} />
             <BottomMetric label="Realized PnL" value={formatMoney(stats.totalPnl)} tone={stats.totalPnl >= 0 ? "positive" : "negative"} />
-            <BottomMetric label="Win Rate" value={`${Math.round(stats.winRate * 100)}%`} />
+            <BottomMetric label="Win Rate" value={formatPercent(stats.winRate)} />
             <BottomMetric label="Trades" value={String(stats.closedTrades.length)} />
           </div>
         </footer>
@@ -875,6 +1209,51 @@ function findCandleIndexAtOrBefore(candles: Candle[], time: number | null) {
   return result;
 }
 
+function isEditableTarget(target: EventTarget | null) {
+  if (!(target instanceof HTMLElement)) {
+    return false;
+  }
+
+  const tagName = target.tagName.toLowerCase();
+
+  return target.isContentEditable || tagName === "input" || tagName === "textarea" || tagName === "select";
+}
+
+function drawingToolForShortcut(
+  key: string,
+  altKey: boolean,
+  shiftKey: boolean,
+  ctrlKey: boolean,
+  metaKey: boolean,
+): DrawingTool | null {
+  if (!altKey || ctrlKey || metaKey) {
+    return null;
+  }
+
+  if (shiftKey) {
+    if (key === "r") return "rectangle";
+    if (key === "l") return "short-position";
+    return null;
+  }
+
+  switch (key) {
+    case "t":
+      return "trend";
+    case "h":
+      return "horizontal";
+    case "v":
+      return "vertical";
+    case "c":
+      return "cross";
+    case "f":
+      return "fib";
+    case "l":
+      return "long-position";
+    default:
+      return null;
+  }
+}
+
 function ToolbarIcon({ children, title }: { children: ReactNode; title: string }) {
   return (
     <button type="button" title={title} aria-label={title} className="inline-flex h-full w-11 items-center justify-center text-[#b5bac2] transition hover:bg-[#111316] hover:text-white">
@@ -921,11 +1300,55 @@ function MinusIcon() {
   );
 }
 
+function VerticalIcon() {
+  return (
+    <svg viewBox="0 0 24 24" className="size-5" aria-hidden>
+      <path d="M12 4v16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function CrossLineIcon() {
+  return (
+    <svg viewBox="0 0 24 24" className="size-5" aria-hidden>
+      <path d="M4 12h16M12 4v16" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function RectangleIcon() {
+  return (
+    <svg viewBox="0 0 24 24" className="size-5" aria-hidden>
+      <rect x="5" y="6" width="14" height="12" fill="none" stroke="currentColor" strokeWidth="1.8" rx="1.5" />
+    </svg>
+  );
+}
+
 function FibIcon() {
   return (
     <svg viewBox="0 0 24 24" className="size-5" aria-hidden>
       <path d="M4 5h16M4 9h16M4 13h16M4 17h16M4 21h16" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
       <path d="M6 5v16" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" opacity="0.55" />
+    </svg>
+  );
+}
+
+function LongPositionIcon() {
+  return (
+    <svg viewBox="0 0 24 24" className="size-5" aria-hidden>
+      <rect x="4" y="4" width="16" height="7" rx="1" fill="rgba(34,197,94,0.28)" stroke="#22c55e" strokeWidth="1.5" />
+      <rect x="4" y="13" width="16" height="7" rx="1" fill="rgba(239,68,68,0.22)" stroke="#ef4444" strokeWidth="1.5" />
+      <line x1="4" x2="20" y1="11.5" y2="11.5" stroke="currentColor" strokeWidth="1.5" />
+    </svg>
+  );
+}
+
+function ShortPositionIcon() {
+  return (
+    <svg viewBox="0 0 24 24" className="size-5" aria-hidden>
+      <rect x="4" y="4" width="16" height="7" rx="1" fill="rgba(239,68,68,0.22)" stroke="#ef4444" strokeWidth="1.5" />
+      <rect x="4" y="13" width="16" height="7" rx="1" fill="rgba(34,197,94,0.28)" stroke="#22c55e" strokeWidth="1.5" />
+      <line x1="4" x2="20" y1="11.5" y2="11.5" stroke="currentColor" strokeWidth="1.5" />
     </svg>
   );
 }
@@ -1082,6 +1505,26 @@ function formatMoney(value: number) {
     currency: "USD",
     maximumFractionDigits: 0,
   });
+}
+
+function formatPercent(value: number) {
+  return `${Math.round(value * 100)}%`;
+}
+
+function formatRatio(value: number) {
+  if (!Number.isFinite(value)) {
+    return "Inf";
+  }
+
+  return value.toFixed(2);
+}
+
+function formatSavedTime(timestamp: number) {
+  return new Intl.DateTimeFormat("en-US", {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  }).format(new Date(timestamp));
 }
 
 function formatDateTime(timestamp: number) {

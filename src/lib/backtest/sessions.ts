@@ -54,6 +54,14 @@ export function sessionForTimestamp(timestamp: number): SessionInfo {
   };
 }
 
+export function getSimpleSession(timestamp: number): "asia" | "london" | "us" {
+  const { hour, minute } = getNewYorkClock(timestamp);
+  const minutes = hour * 60 + minute;
+  if (minutes >= 9 * 60 + 30 && minutes < 16 * 60) return "us";
+  if (minutes >= 2 * 60 && minutes < 9 * 60 + 30) return "london";
+  return "asia";
+}
+
 export function getSessionStartMarkers(candles: Candle[]) {
   const markers: Array<{
     time: number;
